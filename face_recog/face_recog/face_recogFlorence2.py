@@ -54,6 +54,7 @@ class FaceServiceNode(Node):
         self.recognition_srv = self.create_service(FaceRecog, 'detect_person', self.detect_handler)
         self.indentify_srv = self.create_service(FaceRecog, 'identify_person', self.identify_handler)
         self.describe_srv = self.create_service(FaceRecog, 'describe_person', self.describe_handler)
+        self.register_srv = self.create_service(FaceRecog, 'register_person', self.register_handler)
         self.get_logger().info(">>> SERVICE READY: Waiting for requests...")
 
     def image_callback(self, msg):
@@ -82,7 +83,7 @@ class FaceServiceNode(Node):
             area = (x2 - x1) * (y2 - y1)
             dist = np.linalg.norm(box_center - img_center)
         
-            score = area / (dist + 1e-3)
+            score = area / (dist + 1)
             
             if score > best_score:
                 best_score = score
@@ -135,18 +136,75 @@ class FaceServiceNode(Node):
             response.description = "Person not recognized"
 
     def describe_handler(self, request, response):
-        frame = self.bridge.imgmsg_to_cv2(request.image, "bgr8")
+        frame = self.current_frame
+        h, w, _ = frame.shape
 
         pil_img = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-        result = self.run_florence("<DETAILED_CAPTION>", pil_img)
+        # 🔍 detectar personas con Florence
+        results = self.run_florence("<CAPTION_TO_PHRASE_GROUNDING>", pil_img, "person")
+        bboxes = results.get('<CAPTION_TO_PHRASE_GROUNDING>', {}).get('bboxes', [])
+
+        if not bboxes:
+            response.success = False
+            response.description = "No person detected"
+            return response
+
+        target = self.select_best_target(bboxes, w, h)
+        tx1, ty1, tx2, ty2 = map(int, target)
+
+        person_h = ty2 - ty1
+        zoom_ty2 = int(ty1 + (person_h * 0.65))
+
+        crop = frame[max(0, ty1):min(h, zoom_ty2),
+                    max(0, tx1):min(w, tx2)]
+
+        pil_crop = PILImage.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+
+        result = self.run_florence("<DETAILED_CAPTION>", pil_crop)
         description = result.get("<DETAILED_CAPTION>", "")
 
-        response.successs = True
+        response.success = True
         response.description = description
-
         return response
     
+    def register_handler(self, request, response):
+        if not request.person_name.strip():
+            response.success = False
+            response.description = "No name provided"
+            return response
+
+        frame = self.current_frame
+        h, w, _ = frame.shape
+
+        self.detector.setInputSize((w, h))
+        _, faces = self.detector.detect(frame)
+
+        if faces is None or len(faces) == 0:
+            response.success = False
+            response.description = "No face detected"
+            return response
+
+
+        face = max(faces, key=lambda f: f[2] * f[3])
+
+        face_align = self.recognizer.alignCrop(frame, face)
+        feat = self.recognizer.feature(face_align)
+
+        name = request.person_name.strip()
+
+        img_path = os.path.join(self.faces_dir, f"{name}.png")
+        cv2.imwrite(img_path, frame)
+
+        self.load_known_faces()
+
+        response.success = True
+        response.name = name
+        response.description = f"{name} registered successfully"
+
+        self.get_logger().info(f"Registered new person: {name}")
+
+        return response
     """
     def identify_callback(self, request, response):
         if self.current_frame is None:
