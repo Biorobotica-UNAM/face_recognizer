@@ -21,6 +21,9 @@ class FaceServiceNode(Node):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
+        # --- Parameters ---
+        self.declare_parameter("image_topic", "/kinect/image_raw")
+
         # --- Rutas ---
         base_path = os.path.expanduser("~/face_recognizer")
         self.model_dir = os.path.join(base_path, "models")
@@ -44,8 +47,13 @@ class FaceServiceNode(Node):
         self.known_embeddings = {}
         self.load_known_faces()
 
-        self.sub = self.create_subscription(ROSImage, '/kinect/image_raw', self.image_callback, 10)
-        self.srv = self.create_service(FaceRecog, 'identify_person', self.identify_callback)
+        self.sub = self.create_subscription(ROSImage, 
+                                            self.get_parameter("image_topic").value, 
+                                            self.image_callback, 5)
+
+        self.recognition_srv = self.create_service(FaceRecog, 'detect_person', self.detect_handler)
+        self.indentify_srv = self.create_service(FaceRecog, 'identify_person', self.identify_handler)
+        self.describe_srv = self.create_service(FaceRecog, 'describe_person', self.describe_handler)
         self.get_logger().info(">>> SERVICE READY: Waiting for requests...")
 
     def image_callback(self, msg):
@@ -74,18 +82,76 @@ class FaceServiceNode(Node):
             area = (x2 - x1) * (y2 - y1)
             dist = np.linalg.norm(box_center - img_center)
         
-            score = area / (dist + 1)
+            score = area / (dist + 1e-3)
             
             if score > best_score:
                 best_score = score
                 best_bbox = box
         
         return best_bbox
+    
+    def detect_handler(self, request, response):
+        frame = self.current_frame
 
+        h, w, _ = frame.shape
+        self.detector.setInputSize((w, h))
+        _, faces = self.detector.detect(frame)
+        
+        if faces is not None and len(faces) > 0:
+            response.success = True
+            response.description = f"Detected {len(faces)} person(s)"
+        else:
+            response.success = False
+            response.description = "No person detected"
+        return response
+    
+    def identify_handler(self, request, response):
+        frame = self.current_frame
+
+        h, w, _ = frame.shape
+        self.detector.setInputSize((w, h))
+        _, faces = self.detector.detect(frame)
+
+        if faces is None and len(faces) == 0:
+            response.success = False
+            response.description = "No person detected"
+            return response
+        
+        for face in faces:
+            face_align = self.recognizer.alignCrop(frame, face)
+            feat = self.recognizer.feature(face_align)
+
+            for name, saved_feat in self.known_embeddings.items():
+                score = self.recognizer.match(feat, saved_feat, cv2.FaceRecognizerSF_FR_COSINE)
+                if score > 0.363:
+                    response.name = name
+                    response.success = True
+                    response.description = f"Identified: {name}"
+                    return response
+            
+
+            response.name = "Unknown"
+            response.success = False
+            response.description = "Person not recognized"
+
+    def describe_handler(self, request, response):
+        frame = self.bridge.imgmsg_to_cv2(request.image, "bgr8")
+
+        pil_img = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+        result = self.run_florence("<DETAILED_CAPTION>", pil_img)
+        description = result.get("<DETAILED_CAPTION>", "")
+
+        response.successs = True
+        response.description = description
+
+        return response
+    
+    """
     def identify_callback(self, request, response):
         if self.current_frame is None:
             self.get_logger().error("Sin imagen de Kinect.")
-            response.succes = False
+            response.success = False
             return response
 
         frame = self.current_frame.copy()
@@ -97,7 +163,7 @@ class FaceServiceNode(Node):
         bboxes = results.get('<CAPTION_TO_PHRASE_GROUNDING>', {}).get('bboxes', [])
 
         if not bboxes:
-            response.succes = False
+            response.success = False
             response.description = "don't see any person, please look to the camera"
             return response
 
@@ -150,7 +216,7 @@ class FaceServiceNode(Node):
             final_desc = f"{identity} is {core_description}"
             response.name = identity
             response.description = final_desc
-            response.succes = True
+            response.success = True
             self.get_logger().info(f"Identified: {identity}")
         else:
             self.get_logger().warn("PERSON NOT KNOWN.")
@@ -179,9 +245,10 @@ class FaceServiceNode(Node):
             else:
                 response.name = "Unknown"
                 response.description = f"Unknown person is {core_description}"
-            response.succes = True
+            response.success = True
 
         return response
+        """
     
     def run_florence(self, task, pil_img, text_input=""):
         inputs = self.processor(text=task + text_input, images=pil_img, return_tensors="pt").to(self.device, self.torch_dtype)

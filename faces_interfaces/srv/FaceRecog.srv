@@ -2,7 +2,7 @@
 sensor_msgs/Image image
 ---
 # Response
-bool succes
+bool success
 string name 
 string description
 
