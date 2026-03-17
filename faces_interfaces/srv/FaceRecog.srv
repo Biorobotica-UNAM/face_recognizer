@@ -1,5 +1,6 @@
 # Request
 sensor_msgs/Image image
+string name
 ---
 # Response
 bool success
