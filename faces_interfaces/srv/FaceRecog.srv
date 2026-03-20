@@ -1,5 +1,4 @@
 # Request
-sensor_msgs/Image image
 string name
 ---
 # Response

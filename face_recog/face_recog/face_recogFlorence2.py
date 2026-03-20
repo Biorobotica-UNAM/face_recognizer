@@ -21,7 +21,7 @@ class FaceServiceNode(Node):
         self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
         # --- Parameters ---
-        self.declare_parameter("image_topic", "/kinect/image_raw")
+        self.declare_parameter("image_topic", "/head_rgbd_sensor/rgb/image_rect_color") #/head_rgbd_sensor/rgb/image_rect_color && /kinect/image_raw
 
         # --- Rutas ---
         base_path = os.path.expanduser("~/vision")
@@ -99,6 +99,14 @@ class FaceServiceNode(Node):
     
     def detect_handler(self, request, response):
         frame = self.current_frame
+        
+        # --- VALIDACIÓN CRÍTICA ---
+        if frame is None:
+            self.get_logger().warn("Servicio detect_person llamado pero no hay frames de cámara.")
+            response.success = False
+            response.description = "No camera frame received yet"
+            return response
+        # --------------------------
 
         h, w, _ = frame.shape
         self.detector.setInputSize((w, h))
@@ -114,12 +122,17 @@ class FaceServiceNode(Node):
     
     def identify_handler(self, request, response):
         frame = self.current_frame
+        
+        if frame is None:
+            response.success = False
+            response.description = "No camera frame received yet"
+            return response
 
         h, w, _ = frame.shape
         self.detector.setInputSize((w, h))
         _, faces = self.detector.detect(frame)
 
-        if faces is None and len(faces) == 0:
+        if faces is None or len(faces) == 0: # Corregido check de longitud
             response.success = False
             response.description = "No person detected"
             return response
@@ -136,18 +149,23 @@ class FaceServiceNode(Node):
                     response.description = f"Identified: {name}"
                     return response
             
-
-            response.name = "Unknown"
-            response.success = False
-            response.description = "Person not recognized"
+        response.name = "Unknown"
+        response.success = False
+        response.description = "Person not recognized"
+        return response
 
     def describe_handler(self, request, response):
         frame = self.current_frame
+        if frame is None:
+            response.success = False
+            response.description = "No camera frame received yet"
+            return response
+            
         h, w, _ = frame.shape
 
         pil_img = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-        # 🔍 detectar personas con Florence
+        #  detectar personas con Florence
         results = self.run_florence("<CAPTION_TO_PHRASE_GROUNDING>", pil_img, "person")
         bboxes = results.get('<CAPTION_TO_PHRASE_GROUNDING>', {}).get('bboxes', [])
 
@@ -175,7 +193,7 @@ class FaceServiceNode(Node):
         return response
     
     def register_handler(self, request, response):
-        if not request.person_name.strip():
+        if not request.name.strip():
             response.success = False
             response.description = "No name provided"
             return response
@@ -197,7 +215,7 @@ class FaceServiceNode(Node):
         face_align = self.recognizer.alignCrop(frame, face)
         feat = self.recognizer.feature(face_align)
 
-        name = request.person_name.strip()
+        name = request.name.strip()
 
         img_path = os.path.join(self.faces_dir, f"{name}.png")
         cv2.imwrite(img_path, frame)
