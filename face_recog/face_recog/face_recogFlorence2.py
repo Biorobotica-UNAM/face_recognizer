@@ -11,6 +11,7 @@ from PIL import Image as PILImage
 import numpy as np
 import torch
 import glob
+import re
 from transformers import AutoProcessor, AutoModelForCausalLM
 
 class FaceServiceNode(Node):
@@ -21,7 +22,7 @@ class FaceServiceNode(Node):
         self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
         # --- Parameters ---
-        self.declare_parameter("image_topic", "/head_rgbd_sensor/rgb/image_rect_color") #/head_rgbd_sensor/rgb/image_rect_color && /kinect/image_raw
+        self.declare_parameter("image_topic", "/kinect/image_raw") #/head_rgbd_sensor/rgb/image_rect_color && /kinect/image_raw
 
         # --- Rutas ---
         base_path = os.path.expanduser("~/vision")
@@ -100,13 +101,12 @@ class FaceServiceNode(Node):
     def detect_handler(self, request, response):
         frame = self.current_frame
         
-        # --- VALIDACIÓN CRÍTICA ---
+        # --- VALIDACIÓN DE FRAME ---
         if frame is None:
             self.get_logger().warn("Servicio detect_person llamado pero no hay frames de cámara.")
             response.success = False
             response.description = "No camera frame received yet"
             return response
-        # --------------------------
 
         h, w, _ = frame.shape
         self.detector.setInputSize((w, h))
@@ -143,7 +143,7 @@ class FaceServiceNode(Node):
 
             for name, saved_feat in self.known_embeddings.items():
                 score = self.recognizer.match(feat, saved_feat, cv2.FaceRecognizerSF_FR_COSINE)
-                if score > 0.363:
+                if score > 0.30: # Umbral de similitud (ajustar según pruebas)
                     response.name = name
                     response.success = True
                     response.description = f"Identified: {name}"
@@ -162,10 +162,8 @@ class FaceServiceNode(Node):
             return response
             
         h, w, _ = frame.shape
-
         pil_img = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-        #  detectar personas con Florence
         results = self.run_florence("<CAPTION_TO_PHRASE_GROUNDING>", pil_img, "person")
         bboxes = results.get('<CAPTION_TO_PHRASE_GROUNDING>', {}).get('bboxes', [])
 
@@ -177,20 +175,62 @@ class FaceServiceNode(Node):
         target = self.select_best_target(bboxes, w, h)
         tx1, ty1, tx2, ty2 = map(int, target)
 
-        person_h = ty2 - ty1
-        zoom_ty2 = int(ty1 + (person_h * 0.65))
-
-        crop = frame[max(0, ty1):min(h, zoom_ty2),
-                    max(0, tx1):min(w, tx2)]
-
+        crop = frame[max(0, ty1):min(h, ty2), max(0, tx1):min(w, tx2)]
         pil_crop = PILImage.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-
         result = self.run_florence("<DETAILED_CAPTION>", pil_crop)
-        description = result.get("<DETAILED_CAPTION>", "")
+        raw_output = result.get("<DETAILED_CAPTION>", "").lower()
+        self.get_logger().info(f"FLORENCE RAW: {raw_output}")
+        
+        # Genero
+        gender = "male" if any(x in raw_output for x in ["man", "boy", "male"]) else "female" if any(x in raw_output for x in ["woman", "girl", "female"]) else "person"
+        
+        # Color de playera
+        colors = ["black", "white", "red", "blue", "green", "yellow", "gray", "grey", "navy", "orange", "purple"]
+        shirt_color = "unknown color"
+        for c in colors:
+            if c in raw_output:
+                shirt_color = f"{c} shirt"
+                break
 
+        # Edad
+        age = "adult"
+        if "young" in raw_output or "boy" in raw_output or "girl" in raw_output:
+            age = "young"
+        elif "elderly" in raw_output or "old" in raw_output:
+            age = "elderly"
+
+        # Accesorios
+        acc_found = []
+        if "chain" in raw_output or "necklace" in raw_output: acc_found.append("chain")
+        if "watch" in raw_output: acc_found.append("watch")
+        if "glasses" in raw_output or "spectacles" in raw_output: acc_found.append("glasses")
+        if "hat" in raw_output or "cap" in raw_output: acc_found.append("hat")
+        if "glasses" in raw_output or "spectacles" in raw_output: acc_found.append("glasses")
+        if "headphones" in raw_output or "headset" in raw_output: acc_found.append("headphones")
+        if "beard" in raw_output or "mustache" in raw_output: acc_found.append("facial hair")
+        
+        accessories = ", ".join(acc_found) if acc_found else "no accessories"
+        final_result = f"{gender}, {shirt_color}, {age}, {accessories}"
         response.success = True
-        response.description = description
+        response.description = final_result
         return response
+
+    def run_florence(self, task, pil_img, text_input=""):
+        prompt = task + text_input
+        
+        inputs = self.processor(text=prompt, images=pil_img, return_tensors="pt").to(self.device, self.torch_dtype)
+        
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                input_ids=inputs["input_ids"], 
+                pixel_values=inputs["pixel_values"], 
+                max_new_tokens=128, # Más tokens para que no se corte la descripción
+                do_sample=False,
+                num_beams=3
+            )
+        
+        generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        return self.processor.post_process_generation(generated_text, task=task, image_size=(pil_img.width, pil_img.height))
     
     def register_handler(self, request, response):
         if not request.name.strip():
@@ -229,13 +269,7 @@ class FaceServiceNode(Node):
         self.get_logger().info(f"Registered new person: {name}")
 
         return response
-
-    def run_florence(self, task, pil_img, text_input=""):
-        inputs = self.processor(text=task + text_input, images=pil_img, return_tensors="pt").to(self.device, self.torch_dtype)
-        with torch.no_grad():
-            generated_ids = self.model.generate(input_ids=inputs["input_ids"], pixel_values=inputs["pixel_values"], max_new_tokens=512)
-        generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-        return self.processor.post_process_generation(generated_text, task=task, image_size=(pil_img.width, pil_img.height))
+  
 
 def main(args=None):
     rclpy.init(args=args)
