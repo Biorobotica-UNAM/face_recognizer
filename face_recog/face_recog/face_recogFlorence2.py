@@ -22,7 +22,7 @@ class FaceServiceNode(Node):
         self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
         # --- Parameters ---
-        self.declare_parameter("image_topic", "/kinect/image_raw") #/head_rgbd_sensor/rgb/image_rect_color && /kinect/image_raw
+        self.declare_parameter("image_topic", "/camera/rgb/image_raw") #/head_rgbd_sensor/rgb/image_rect_color && /kinect/image_raw
 
         # --- Rutas ---
         base_path = os.path.expanduser("~/vision")
@@ -141,18 +141,25 @@ class FaceServiceNode(Node):
             face_align = self.recognizer.alignCrop(frame, face)
             feat = self.recognizer.feature(face_align)
 
+            best_name = "Unknown"
+            max_score = -1.0
+
             for name, saved_feat in self.known_embeddings.items():
                 score = self.recognizer.match(feat, saved_feat, cv2.FaceRecognizerSF_FR_COSINE)
-                if score > 0.30: # Umbral de similitud (ajustar según pruebas)
-                    response.name = name
-                    response.success = True
-                    response.description = f"Identified: {name}"
-                    return response
-            
-        response.name = "Unknown"
-        response.success = False
-        response.description = "Person not recognized"
-        return response
+
+                if score > max_score:
+                    max_score = score
+                    best_name = name
+
+            if max_score > 0.5: # Umbral de confianza
+                response.name = best_name
+                response.success = True
+                response.description = f"Identified: {best_name} (score: {max_score:.2f})"
+            else:
+                response.name = "Unknown"
+                response.success = False
+                response.description = "Person not recognized (Score too low)"
+            return response
 
     def describe_handler(self, request, response):
         frame = self.current_frame
@@ -177,9 +184,9 @@ class FaceServiceNode(Node):
 
         crop = frame[max(0, ty1):min(h, ty2), max(0, tx1):min(w, tx2)]
         pil_crop = PILImage.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-        result = self.run_florence("<DETAILED_CAPTION>", pil_crop)
-        raw_output = result.get("<DETAILED_CAPTION>", "").lower()
-        self.get_logger().info(f"FLORENCE RAW: {raw_output}")
+        result = self.run_florence("<MORE_DETAILED_CAPTION>", pil_crop)
+        raw_output = result.get("<MORE_DETAILED_CAPTION>", "").lower()
+        self.get_logger().info(f"FLORENCE DESCRIPTION: {raw_output}")
         
         # Genero
         gender = "male" if any(x in raw_output for x in ["man", "boy", "male"]) else "female" if any(x in raw_output for x in ["woman", "girl", "female"]) else "person"
@@ -191,6 +198,40 @@ class FaceServiceNode(Node):
             if c in raw_output:
                 shirt_color = f"{c} shirt"
                 break
+        #cabello
+        hair = "unknown hair"
+        hair_color = ""
+        for c in ["black", "dark", "brown", "blonde", "gray", "white", "blue"]:
+            if c in raw_output:
+                hair_color = c
+                break
+        
+        if "messy" in raw_output or "disheveled" in raw_output:
+            style = "messy"
+        elif "short" in raw_output:
+            style = "short"
+        elif "long" in raw_output:
+            style = "long"
+        else:
+            style = ""
+
+        if "bald" in raw_output:
+            hair = "bald"
+        elif style and hair_color:
+            hair = f"{style} {hair_color} hair"
+        elif hair_color:
+            hair = f"{hair_color} hair"
+        elif style:
+            hair = f"{style} hair"
+
+
+        #emocion
+        emotion = "neutral"
+        if "smile" in raw_output or "happy" in raw_output: emotion = "happy"
+        elif "sad" in raw_output: emotion = "sad"
+        elif "angry" in raw_output: emotion = "angry"
+        elif "surprised" in raw_output: emotion = "surprised"
+        elif "serious" in raw_output or "seriously" in raw_output: emotion = "serious"
 
         # Edad
         age = "adult"
@@ -198,6 +239,7 @@ class FaceServiceNode(Node):
             age = "young"
         elif "elderly" in raw_output or "old" in raw_output:
             age = "elderly"
+        
 
         # Accesorios
         acc_found = []
@@ -210,7 +252,7 @@ class FaceServiceNode(Node):
         if "beard" in raw_output or "mustache" in raw_output: acc_found.append("facial hair")
         
         accessories = ", ".join(acc_found) if acc_found else "no accessories"
-        final_result = f"{gender}, {shirt_color}, {age}, {accessories}"
+        final_result = f"{gender}, {shirt_color}, {age}, {hair}, {emotion}, {accessories}"
         response.success = True
         response.description = final_result
         return response
@@ -224,9 +266,12 @@ class FaceServiceNode(Node):
             generated_ids = self.model.generate(
                 input_ids=inputs["input_ids"], 
                 pixel_values=inputs["pixel_values"], 
-                max_new_tokens=128, # Más tokens para que no se corte la descripción
-                do_sample=False,
-                num_beams=3
+                max_new_tokens= 350, # cantidad de palabras a generar
+                do_sample= True, # creatividad descriptiva 
+                temperature= 0.8, # control de aleatoriedad
+                num_beams=3,
+                top_p=0.9,
+                early_stopping=True 
             )
         
         generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
