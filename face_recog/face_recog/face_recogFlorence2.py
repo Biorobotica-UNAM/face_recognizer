@@ -3,7 +3,7 @@
 import os
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image as ROSImage
+from sensor_msgs.msg import Image as ROSImage, CameraInfo
 from faces_interfaces.srv import FaceRecog
 import cv2
 from cv_bridge import CvBridge
@@ -22,8 +22,8 @@ class FaceServiceNode(Node):
         self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
         # --- Parameters ---
-        self.declare_parameter("image_topic", "/camera/rgb/image_raw") #/head_rgbd_sensor/rgb/image_rect_color && /kinect/image_raw
-
+        self.declare_parameter("image_topic", "/kinect/image_raw") #/head_rgbd_sensor/rgb/image_rect_color && /kinect/image_raw
+        self.declare_parameter("info_topic", "/kinect/camera_info")
         # --- Rutas ---
         base_path = os.path.expanduser("~/vision")
         self.model_dir = os.path.join(base_path, "models")
@@ -45,6 +45,9 @@ class FaceServiceNode(Node):
         self.current_frame = None
         self.known_embeddings = {}
         self.load_known_faces()
+         
+        self.intrinsics = None
+        self.info_sub = self.create_subscription(CameraInfo, self.get_parameter("info_topic").value, self.info_callback, 10)
 
         self.sub = self.create_subscription(ROSImage, 
                                             self.get_parameter("image_topic").value, 
@@ -54,15 +57,20 @@ class FaceServiceNode(Node):
         id_srv_name = 'identify_person'
         desc_srv_name = 'describe_person'
         reg_srv_name = 'register_person'
+        get_srv_name = 'get_face_coords'
 
         self.recognition_srv = self.create_service(FaceRecog, det_srv_name, self.detect_handler)
         self.indentify_srv = self.create_service(FaceRecog, id_srv_name, self.identify_handler)
         self.describe_srv = self.create_service(FaceRecog, desc_srv_name, self.describe_handler)
         self.register_srv = self.create_service(FaceRecog, reg_srv_name, self.register_handler)
+        self.get_coords_srv = self. create_service(FaceRecog,get_srv_name, self.get_coords_handler)
 
-        self.get_logger().info(f"Servers ready: Waiting for requests on: {det_srv_name}, {id_srv_name}, {desc_srv_name}, {reg_srv_name}")
+        self.get_logger().info(f"Servers ready: Waiting for requests on: {det_srv_name}, {id_srv_name}, {desc_srv_name}, {reg_srv_name}, {get_srv_name}")
 
-
+    def info_callback(self, msg):
+        self.intrinsics = {'fx': msg.k[0], 'fy': msg.k[4], 'cx': msg.k[2], 'cy': msg.k[5]}
+        self.get_logger().info(f"Camera Info linked: fx={self.intrinsics['fx']:.2f}")
+        self.destroy_subscription(self.info_sub)
 
     def image_callback(self, msg):
         self.current_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -103,7 +111,7 @@ class FaceServiceNode(Node):
         
         # --- VALIDACIÓN DE FRAME ---
         if frame is None:
-            self.get_logger().warn("Servicio detect_person llamado pero no hay frames de cámara.")
+            self.get_logger().warn("service detect_person called but not image yet")
             response.success = False
             response.description = "No camera frame received yet"
             return response
@@ -192,16 +200,22 @@ class FaceServiceNode(Node):
         gender = "male" if any(x in raw_output for x in ["man", "boy", "male"]) else "female" if any(x in raw_output for x in ["woman", "girl", "female"]) else "person"
         
         # Color de playera
-        colors = ["black", "white", "red", "blue", "green", "yellow", "gray", "grey", "navy", "orange", "purple"]
+        shirt_type = ["shirt", "t-shirt", "jersey"]
+        colors = ["black", "white", "red", "blue", "green", "yellow", "gray", "grey", "navy", "orange", "purple", "navy blue", "navy white", "navy black"]
         shirt_color = "unknown color"
+        lowest_index = float('inf')
+
         for c in colors:
             if c in raw_output:
-                shirt_color = f"{c} shirt"
-                break
+                index = raw_output.find(c)
+                if index < lowest_index:
+                    lowest_index = index
+                shirt_color = f"{c} {shirt_type}"
+                
         #cabello
         hair = "unknown hair"
         hair_color = ""
-        for c in ["black", "dark", "brown", "blonde", "gray", "white", "blue"]:
+        for c in ["black", "dark", "brown", "blonde", "gray", "white", "blonde"]:
             if c in raw_output:
                 hair_color = c
                 break
@@ -314,7 +328,60 @@ class FaceServiceNode(Node):
         self.get_logger().info(f"Registered new person: {name}")
 
         return response
-  
+    
+    """def get_coords_handler(self, request, response):
+        if self.current_frame is None or self.intrinsics is None:
+            response.success = False
+            return response
+        h, w, _ = self.current_frame.shape
+        self.detector.setInputSize((w, h))
+        _, faces = self.detector.detect(self.current_frame)
+        if faces is not None and len(faces) > 0:
+            face = max(faces, key=lambda f: f[2] * f[3]) #cara mas cerca
+            nx, ny = face[10], face[11] # Landmarks: Punta de la nariz
+            z_m = (0.15 * self.intrinsics['fx']) / face[2] # Estimación basada en ancho de cara
+            response.x = float((nx - self.intrinsics['cx']) * z_m / self.intrinsics['fx'])
+            response.y = float((ny - self.intrinsics['cy']) * z_m / self.intrinsics['fy'])
+            response.z = float(z_m)
+            response.success = True
+            response.coords = f"Position in: {response.x:.2f}, {response.y:.2f}, {response.z:.2f}"
+        else:
+            response.success = False
+        return response"""
+    
+    def get_coords_handler(self, request, response):
+        if self.current_frame is None or self.intrinsics is None:
+            response.success = False 
+            return response
+        h, w, _ = self.current_frame.shape
+        self.detector.setInputSize((w, h))
+        _, faces = self.detector.detect(self.current_frame)
+        if faces is not None and len(faces) > 0:
+            face = max(faces, key=lambda f: f[2] * f[3]) #cara mas cercana
+
+            u_min, v_min = face[0], face[1]      # Top-left
+            width_px, height_px = face[2], face[3]
+            u_max, v_max = u_min + width_px, v_min + height_px
+
+            z_m = (0.15 * self.intrinsics['fx'] / width_px)
+
+            fx = self.intrinsics['fx']
+            fy = self.intrinsics['fy']
+            cx = self.intrinsics['cx']
+            cy = self.intrinsics['cy']
+
+            response.x_min = (float((u_min - cx) * z_m / fx))
+            response.x_max = (float((u_max - cx) * z_m / fx))
+            response.y_min = (float((v_min - cy) * z_m / fy))
+            response.y_max = (float((v_max - cy) * z_m / fy))
+            response.z = (float(z_m))
+            response.coords = f"Position in: {response.x_min:.2f}, {response.x_max:.2f}, {response.y_min:.2f}, {response.y_max:.2f}, {response.z:.2f}"
+            response.success = True
+        else:
+            response.success = False
+            response.coords = "No face detected"
+            
+        return response
 
 def main(args=None):
     rclpy.init(args=args)
