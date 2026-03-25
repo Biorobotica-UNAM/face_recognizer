@@ -200,18 +200,30 @@ class FaceServiceNode(Node):
         gender = "male" if any(x in raw_output for x in ["man", "boy", "male"]) else "female" if any(x in raw_output for x in ["woman", "girl", "female"]) else "person"
         
         # Color de playera
-        shirt_type = ["shirt", "t-shirt", "jersey"]
-        colors = ["black", "white", "red", "blue", "green", "yellow", "gray", "grey", "navy", "orange", "purple", "navy blue", "navy white", "navy black"]
-        shirt_color = "unknown color"
-        lowest_index = float('inf')
+        prendas = ["t-shirt", "shirt", "jersey", "jacket", "hoodie", "sweater", "polo"]
+        colores = ["green", "red", "black", "white", "blue", "yellow", "gray", "grey", "navy", "orange", "purple"]
 
-        for c in colors:
+        shirt_color = "unknown clothing"
+        distancia_minima = 999 
+
+        prenda_encontrada = "shirt" # Default
+        for p in prendas:
+            if p in raw_output:
+                prenda_encontrada = p
+                break 
+
+        pos_prenda = raw_output.find(prenda_encontrada)
+
+        for c in colores:
             if c in raw_output:
-                index = raw_output.find(c)
-                if index < lowest_index:
-                    lowest_index = index
-                shirt_color = f"{c} {shirt_type}"
+                pos_color = raw_output.find(c)
+                distancia = abs(pos_prenda - pos_color)
                 
+                # El color que tenga la distancia más corta a la palabra 'shirt' gana
+                if distancia < distancia_minima:
+                    distancia_minima = distancia
+                    shirt_color = f"{c} {prenda_encontrada}"
+
         #cabello
         hair = "unknown hair"
         hair_color = ""
