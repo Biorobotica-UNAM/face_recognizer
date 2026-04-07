@@ -57,15 +57,13 @@ class FaceServiceNode(Node):
         id_srv_name = 'identify_person'
         desc_srv_name = 'describe_person'
         reg_srv_name = 'register_person'
-        get_srv_name = 'get_face_coords'
 
         self.recognition_srv = self.create_service(FaceRecog, det_srv_name, self.detect_handler)
         self.indentify_srv = self.create_service(FaceRecog, id_srv_name, self.identify_handler)
         self.describe_srv = self.create_service(FaceRecog, desc_srv_name, self.describe_handler)
         self.register_srv = self.create_service(FaceRecog, reg_srv_name, self.register_handler)
-        self.get_coords_srv = self. create_service(FaceRecog,get_srv_name, self.get_coords_handler)
-
-        self.get_logger().info(f"Servers ready: Waiting for requests on: {det_srv_name}, {id_srv_name}, {desc_srv_name}, {reg_srv_name}, {get_srv_name}")
+    
+        self.get_logger().info(f"Servers ready: Waiting for requests on: {det_srv_name}, {id_srv_name}, {desc_srv_name}, {reg_srv_name}")
 
     def info_callback(self, msg):
         self.intrinsics = {'fx': msg.k[0], 'fy': msg.k[4], 'cx': msg.k[2], 'cy': msg.k[5]}
@@ -111,7 +109,6 @@ class FaceServiceNode(Node):
         
         # --- VALIDACIÓN DE FRAME ---
         if frame is None:
-            self.get_logger().warn("service detect_person called but not image yet")
             response.success = False
             response.description = "No camera frame received yet"
             return response
@@ -119,18 +116,36 @@ class FaceServiceNode(Node):
         h, w, _ = frame.shape
         self.detector.setInputSize((w, h))
         _, faces = self.detector.detect(frame)
+
+        valid_faces = [f for f in faces if f[2] > 40] if faces is not None else []
         
-        if faces is not None and len(faces) > 0:
+        if valid_faces is not None and len(valid_faces) > 0:
+            best_face = max(faces, key=lambda f: f[2] * f[3])
+
+            z_m = 0.0
             response.success = True
-            response.description = f"Detected {len(faces)} person(s)"
+            response.description = f"Detected {len(valid_faces)} person(s). Target at {z_m:.2f}m"
+               
+            response.bbox = [
+                float(best_face[0]), 
+                float(best_face[1]), 
+                float(best_face[0] + best_face[2]), 
+                float(best_face[1] + best_face[3])
+            ]
+            response.z = float(z_m)
+                
         else:
             response.success = False
             response.description = "No person detected"
+            # Opcional: llenar con ceros para evitar basura en la respuesta
+            response.bbox = [0.0, 0.0, 0.0, 0.0]
+            response.z = 0.0
+
         return response
     
     def identify_handler(self, request, response):
         frame = self.current_frame
-        
+
         if frame is None:
             response.success = False
             response.description = "No camera frame received yet"
@@ -140,10 +155,12 @@ class FaceServiceNode(Node):
         self.detector.setInputSize((w, h))
         _, faces = self.detector.detect(frame)
 
-        if faces is None or len(faces) == 0: # Corregido check de longitud
+        if faces is None or len(faces) == 0:
             response.success = False
             response.description = "No person detected"
             return response
+        
+        faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
         
         for face in faces:
             face_align = self.recognizer.alignCrop(frame, face)
@@ -160,14 +177,24 @@ class FaceServiceNode(Node):
                     best_name = name
 
             if max_score > 0.5: # Umbral de confianza
-                response.name = best_name
+
+                z_m = 0.0
                 response.success = True
+                response.name = best_name
+                response.bbox = [
+                    float(face[0]), 
+                    float(face[1]), 
+                    float(face[0] + face[2]), 
+                    float(face[1] + face[3])
+                ]
+                response.z = float(z_m)
                 response.description = f"Identified: {best_name} (score: {max_score:.2f})"
-            else:
-                response.name = "Unknown"
-                response.success = False
-                response.description = "Person not recognized (Score too low)"
-            return response
+                return response
+            
+        response.name = "Unknown"
+        response.success = False
+        response.description = "Person not recognized (Score too low)"
+        return response
 
     def describe_handler(self, request, response):
         frame = self.current_frame
@@ -360,40 +387,6 @@ class FaceServiceNode(Node):
         else:
             response.success = False
         return response"""
-    
-    def get_coords_handler(self, request, response):
-        if self.current_frame is None or self.intrinsics is None:
-            response.success = False 
-            return response
-        h, w, _ = self.current_frame.shape
-        self.detector.setInputSize((w, h))
-        _, faces = self.detector.detect(self.current_frame)
-        if faces is not None and len(faces) > 0:
-            face = max(faces, key=lambda f: f[2] * f[3]) #cara mas cercana
-
-            u_min, v_min = face[0], face[1]      # Top-left
-            width_px, height_px = face[2], face[3]
-            u_max, v_max = u_min + width_px, v_min + height_px
-
-            z_m = (0.15 * self.intrinsics['fx'] / width_px)
-
-            fx = self.intrinsics['fx']
-            fy = self.intrinsics['fy']
-            cx = self.intrinsics['cx']
-            cy = self.intrinsics['cy']
-
-            response.x_min = (float((u_min - cx) * z_m / fx))
-            response.x_max = (float((u_max - cx) * z_m / fx))
-            response.y_min = (float((v_min - cy) * z_m / fy))
-            response.y_max = (float((v_max - cy) * z_m / fy))
-            response.z = (float(z_m))
-            response.coords = f"Position in: {response.x_min:.2f}, {response.x_max:.2f}, {response.y_min:.2f}, {response.y_max:.2f}, {response.z:.2f}"
-            response.success = True
-        else:
-            response.success = False
-            response.coords = "No face detected"
-            
-        return response
 
 def main(args=None):
     rclpy.init(args=args)
