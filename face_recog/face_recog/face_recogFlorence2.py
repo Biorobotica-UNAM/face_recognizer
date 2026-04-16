@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
 import os
+
+from networkx import config
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image as ROSImage, CameraInfo
@@ -12,7 +14,7 @@ import numpy as np
 import torch
 import glob
 import re
-from transformers import AutoProcessor, AutoModelForCausalLM
+from transformers import AutoProcessor, AutoModelForCausalLM, AutoConfig
 
 class FaceServiceNode(Node):
     def __init__(self):
@@ -36,9 +38,18 @@ class FaceServiceNode(Node):
         
         # --- Carga de Modelos ---
         self.get_logger().info("Loading models...")
-        self.model = AutoModelForCausalLM.from_pretrained(face_description_model, trust_remote_code=True, torch_dtype=self.torch_dtype).to(self.device)
-        self.processor = AutoProcessor.from_pretrained(face_description_model, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(face_description_model, trust_remote_code=True)
+        if not hasattr(config, 'forced_bos_token_id'):
+            setattr(config, 'forced_bos_token_id', None)
         
+        self.model = AutoModelForCausalLM.from_pretrained(
+            face_description_model, 
+            config=config,           # <--- Pasamos el config con el parche
+            trust_remote_code=True, 
+            torch_dtype=self.torch_dtype
+        ).to(self.device)
+        
+        self.processor = AutoProcessor.from_pretrained(face_description_model, trust_remote_code=True)
         self.detector = cv2.FaceDetectorYN.create(os.path.join(self.model_dir, face_detection_model), "", (320, 320), 0.9, 0.3, 5000)
         self.recognizer = cv2.FaceRecognizerSF.create(os.path.join(self.model_dir, face_recognition_model), "")
 
