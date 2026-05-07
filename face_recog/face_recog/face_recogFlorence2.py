@@ -70,7 +70,7 @@ class FaceServiceNode(Node):
         self.intrinsics = None
         self.info_sub = self.create_subscription(CameraInfo, self.get_parameter("info_topic").value, self.info_callback, 10)
         self.sub = self.create_subscription(ROSImage, self.get_parameter("image_topic").value, self.image_callback, 5)
-        
+        self.debug_pub = self.create_publisher(ROSImage, "/face_recog/debug_image", 10)
         # Servicios
         self.recognition_srv = self.create_service(FaceRecog, 'detect_person', self.detect_handler)
         self.indentify_srv = self.create_service(FaceRecog, 'identify_person', self.identify_handler)
@@ -83,6 +83,16 @@ class FaceServiceNode(Node):
         self.intrinsics = {'fx': msg.k[0], 'fy': msg.k[4], 'cx': msg.k[2], 'cy': msg.k[5]}
         self.get_logger().info(f"Camera Info linked: fx={self.intrinsics['fx']:.2f}")
         self.destroy_subscription(self.info_sub)
+
+    def publish_debug_image(self, frame, bbox=None, label=None):
+        debug_img = frame.copy()
+        if bbox is not None:
+            x1, y1, x2, y2 = map(int, bbox)
+            cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            if label:
+                cv2.putText(debug_img, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        debug_msg = self.bridge.cv2_to_imgmsg(debug_img, "bgr8")
+        self.debug_pub.publish(debug_msg)
 
     def image_callback(self, msg):
         self.current_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -152,6 +162,7 @@ class FaceServiceNode(Node):
             response.bbox = [float(best_face[0]), float(best_face[1]), 
                              float(best_face[0] + best_face[2]), float(best_face[1] + best_face[3])]
             response.z = 0.0
+            self.publish_debug_image(frame, bbox=response.bbox, label="Person_Detected")
         else:
             response.success = False
             response.description = "No person detected"
@@ -198,6 +209,9 @@ class FaceServiceNode(Node):
                                  float(face[0] + face[2]), float(face[1] + face[3])]
                 response.z = 0.0
                 response.description = f"Identified: {best_name} (score: {max_score:.2f})"
+                label = f"{best_name} ({max_score:.2f})"
+                self.publish_debug_image(frame, bbox=response.bbox, label=label)
+
                 return response
             
         response.name = "Unknown"
@@ -342,6 +356,7 @@ class FaceServiceNode(Node):
         response.name = name
         response.description = f"{name} registered successfully"
         self.get_logger().info(f"Registered new person: {name}")
+        self.publish_debug_image(frame, bbox=[float(face[0]), float(face[1]), float(face[0] + face[2]), float(face[1] + face[3])], label=f"{name} Registered")
         return response
 
 def main(args=None):
