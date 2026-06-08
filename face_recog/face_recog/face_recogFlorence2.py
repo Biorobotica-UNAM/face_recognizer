@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import glob
 import json
+import time
 from datetime import datetime
 from transformers import AutoProcessor, AutoModelForCausalLM, AutoConfig
 
@@ -61,6 +62,14 @@ class FaceServiceNode(Node):
         self.recognizer = cv2.FaceRecognizerSF.create(rec_path, "")
 
         self.current_frame   = None
+        self.frame_count = 0
+        # Cache corto del ultimo detect_person exitoso. RegisterPerson lo usa
+        # para guardar el mismo frame que ya vio la cara, no uno posterior.
+        self.last_detected_frame = None
+        self.last_detected_face = None
+        self.last_detected_frame_count = 0
+        self.last_detected_time = 0.0
+        self.last_detection_ttl_sec = 5.0
         self.known_embeddings = {}
         self.load_known_faces()
 
@@ -94,6 +103,11 @@ class FaceServiceNode(Node):
 
     def image_callback(self, msg):
         self.current_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        # self.frame_count += 1
+        # if self.frame_count == 1 or self.frame_count % 30 == 0:
+        #     h, w = self.current_frame.shape[:2]
+        #     self.get_logger().info(
+        #         f"Image frame received count={self.frame_count} size={w}x{h}")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -270,16 +284,29 @@ class FaceServiceNode(Node):
         if frame is None:
             response.success     = False
             response.description = "No camera frame received yet"
+            self.get_logger().warn(
+                "detect_person request failed: no camera frame received yet")
             return response
 
         h, w, _ = frame.shape
+        self.get_logger().debug(
+            f"detect_person request name='{request.name}' frame_count={self.frame_count} size={w}x{h}")
         self.detector.setInputSize((w, h))
         _, faces = self.detector.detect(frame)
 
         valid_faces = [f for f in faces if f[2] > 40] if faces is not None else []
+        total_faces = 0 if faces is None else len(faces)
+        self.get_logger().debug(
+            f"detect_person raw_faces={total_faces} valid_faces={len(valid_faces)}")
 
         if valid_faces:
             best_face        = max(valid_faces, key=lambda f: f[2] * f[3])
+            # Guardamos el frame completo y la bbox elegida para que el
+            # registro facial no dependa de una segunda deteccion tardia.
+            self.last_detected_frame = frame.copy()
+            self.last_detected_face = best_face.copy()
+            self.last_detected_frame_count = self.frame_count
+            self.last_detected_time = time.monotonic()
             response.success = True
             response.description = f"Detected {len(valid_faces)} person(s)."
             response.bbox = [
@@ -289,12 +316,18 @@ class FaceServiceNode(Node):
                 float(best_face[1] + best_face[3])
             ]
             response.z = 0.0
+            self.get_logger().info(
+                "detect_person success: "
+                f"bbox=[{response.bbox[0]:.1f}, {response.bbox[1]:.1f}, "
+                f"{response.bbox[2]:.1f}, {response.bbox[3]:.1f}]")
             self.publish_debug_image(frame, bbox=response.bbox, label="Person_Detected")
         else:
             response.success     = False
             response.description = "No person detected"
             response.bbox        = [0.0, 0.0, 0.0, 0.0]
             response.z           = 0.0
+            self.get_logger().debug(
+                f"detect_person failed: no valid face over min width; raw_faces={total_faces}")
 
         return response
 
@@ -393,33 +426,62 @@ class FaceServiceNode(Node):
             response.description = "No name provided"
             return response
 
-        frame = self.current_frame
+        name = request.name.strip()
+        frame = None
+        face = None
+        source = "current frame"
+
+        # Usa primero el frame donde detect_person ya encontro una cara.
+        # Asi REGISTERING no depende de una segunda deteccion varios frames despues.
+        if self.last_detected_frame is not None and self.last_detected_face is not None:
+            age = time.monotonic() - self.last_detected_time
+            if age <= self.last_detection_ttl_sec:
+                frame = self.last_detected_frame.copy()
+                face = self.last_detected_face.copy()
+                source = (
+                    f"cached detect_person frame "
+                    f"(age={age:.2f}s, frame_count={self.last_detected_frame_count})")
+            else:
+                self.get_logger().warn(
+                    f"register_person cache expired: age={age:.2f}s "
+                    f"ttl={self.last_detection_ttl_sec:.2f}s")
+
         if frame is None:
-            response.success     = False
-            response.description = "No frame"
-            return response
+            frame = self.current_frame
+            if frame is None:
+                response.success     = False
+                response.description = "No frame"
+                return response
 
-        h, w, _ = frame.shape
-        self.detector.setInputSize((w, h))
-        _, faces = self.detector.detect(frame)
+            h, w, _ = frame.shape
+            self.detector.setInputSize((w, h))
+            _, faces = self.detector.detect(frame)
 
-        if faces is None or len(faces) == 0:
-            response.success     = False
-            response.description = "No face detected"
-            return response
+            if faces is None or len(faces) == 0:
+                response.success     = False
+                response.description = "No face detected"
+                return response
 
-        face     = max(faces, key=lambda f: f[2] * f[3])
-        name     = request.name.strip()
+            face = max(faces, key=lambda f: f[2] * f[3])
+
         img_path = os.path.join(self.faces_dir, f"{name}.png")
-        cv2.imwrite(img_path, frame)
+        face_align = self.recognizer.alignCrop(frame, face)
+        embedding = self.recognizer.feature(face_align)
 
-        # Reload immediately so identify works right after register
+        if not cv2.imwrite(img_path, frame):
+            response.success     = False
+            response.description = f"Could not write face image: {img_path}"
+            return response
+
+        # Recarga el banco en disco y deja el embedding listo en memoria para
+        # que identify_person pueda reconocer a la persona inmediatamente.
         self.load_known_faces()
+        self.known_embeddings[name] = embedding
 
         response.success     = True
         response.name        = name
         response.description = f"{name} registered successfully"
-        self.get_logger().info(f"Registered new person: {name}")
+        self.get_logger().info(f"Registered new person: {name} from {source}")
         self.publish_debug_image(
             frame,
             bbox=[float(face[0]), float(face[1]),
