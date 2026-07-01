@@ -127,10 +127,13 @@ class face_recog(Node):
 
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
 
+                # Si ya está registrado, mostramos su nombre; si no, la categoría genérica
+                label = self.registered_name if self.registered else "Persona"
+
                 cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0,255,0), 2)
                 cv2.putText(
                     debug_img,
-                    f"pendejo  {conf:.2f}",
+                    f"{label}  {conf:.2f}",
                     (x1, y1-10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
