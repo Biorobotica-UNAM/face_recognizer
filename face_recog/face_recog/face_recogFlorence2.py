@@ -70,7 +70,16 @@ class FaceServiceNode(Node):
         self.last_detected_frame_count = 0
         self.last_detected_time = 0.0
         self.last_detection_ttl_sec = 5.0
+        # Umbral recomendado por OpenCV para SFace + cosine similarity (~0.363),
+        # antes estaba en 0.5 que es mas estricto de lo necesario.
+        self.identify_threshold = 0.363
+        # Margen minimo entre el mejor y el segundo mejor score para aceptar
+        # una identificacion como no ambigua.
+        self.identify_margin = 0.05
         self.known_embeddings = {}
+        # Area (px^2) de la cara usada para registrar cada nombre, para no
+        # sobreescribir una referencia buena con una captura de peor calidad.
+        self.known_face_quality = {}
         self.load_known_faces()
 
         self.intrinsics = None
@@ -123,6 +132,7 @@ class FaceServiceNode(Node):
 
     def load_known_faces(self):
         self.known_embeddings = {}
+        self.known_face_quality = {}
         for img_path in glob.glob(os.path.join(self.faces_dir, "*.png")):
             name = os.path.basename(img_path).replace(".png", "")
             img  = cv2.imread(img_path)
@@ -133,6 +143,7 @@ class FaceServiceNode(Node):
             if faces is not None:
                 face_align = self.recognizer.alignCrop(img, faces[0])
                 self.known_embeddings[name] = self.recognizer.feature(face_align)
+                self.known_face_quality[name] = float(faces[0][2] * faces[0][3])
         self.get_logger().info(f"Loaded {len(self.known_embeddings)} known faces.")
 
     def save_report(self, name, description):
@@ -332,55 +343,74 @@ class FaceServiceNode(Node):
         return response
 
     def identify_handler(self, request, response):
-        frame = self.current_frame
+        frame = None
+        face = None
+
+        # Usa el frame cacheado por detect_person (mismo patron que
+        # register_handler) para no depender de un frame nuevo que puede
+        # llegar movido/distinto al que ya se confirmo con cara detectada.
+        if self.last_detected_frame is not None and self.last_detected_face is not None:
+            age = time.monotonic() - self.last_detected_time
+            if age <= self.last_detection_ttl_sec:
+                frame = self.last_detected_frame.copy()
+                face = self.last_detected_face.copy()
+
         if frame is None:
-            response.success     = False
-            response.description = "No camera frame received yet"
-            return response
-
-        h, w, _ = frame.shape
-        self.detector.setInputSize((w, h))
-        _, faces = self.detector.detect(frame)
-
-        if faces is None or len(faces) == 0:
-            response.success     = False
-            response.description = "No person detected"
-            return response
-
-        # Process faces largest-first
-        faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-
-        for face in faces:
-            face_align = self.recognizer.alignCrop(frame, face)
-            feat       = self.recognizer.feature(face_align)
-
-            best_name  = "Unknown"
-            max_score  = -1.0
-
-            for name, saved_feat in self.known_embeddings.items():
-                score = self.recognizer.match(
-                    feat, saved_feat, cv2.FaceRecognizerSF_FR_COSINE)
-                if score > max_score:
-                    max_score = score
-                    best_name = name
-
-            if max_score > 0.5:
-                response.success     = True
-                response.name        = best_name
-                response.bbox        = [
-                    float(face[0]), float(face[1]),
-                    float(face[0] + face[2]), float(face[1] + face[3])
-                ]
-                response.z           = 0.0
-                response.description = f"Identified: {best_name} (score: {max_score:.2f})"
-                self.publish_debug_image(
-                    frame, bbox=response.bbox,
-                    label=f"{best_name} ({max_score:.2f})")
+            frame = self.current_frame
+            if frame is None:
+                response.success     = False
+                response.description = "No camera frame received yet"
                 return response
+
+            h, w, _ = frame.shape
+            self.detector.setInputSize((w, h))
+            _, faces = self.detector.detect(frame)
+
+            if faces is None or len(faces) == 0:
+                response.success     = False
+                response.description = "No person detected"
+                return response
+
+            face = max(faces, key=lambda f: f[2] * f[3])
+
+        face_align = self.recognizer.alignCrop(frame, face)
+        feat       = self.recognizer.feature(face_align)
+
+        best_name    = "Unknown"
+        max_score    = -1.0
+        second_score = -1.0
+
+        for name, saved_feat in self.known_embeddings.items():
+            score = self.recognizer.match(
+                feat, saved_feat, cv2.FaceRecognizerSF_FR_COSINE)
+            if score > max_score:
+                second_score = max_score
+                max_score    = score
+                best_name    = name
+            elif score > second_score:
+                second_score = score
+
+        margin = max_score - second_score if second_score > -1.0 else 1.0
+
+        if max_score > self.identify_threshold and margin > self.identify_margin:
+            response.success     = True
+            response.name        = best_name
+            response.bbox        = [
+                float(face[0]), float(face[1]),
+                float(face[0] + face[2]), float(face[1] + face[3])
+            ]
+            response.z           = 0.0
+            response.description = f"Identified: {best_name} (score: {max_score:.2f})"
+            self.publish_debug_image(
+                frame, bbox=response.bbox,
+                label=f"{best_name} ({max_score:.2f})")
+            return response
 
         response.name        = "Unknown"
         response.success     = False
-        response.description = "Person not recognized (score too low)"
+        response.description = (
+            "Person not recognized (score too low)" if max_score <= self.identify_threshold
+            else f"Ambiguous match: '{best_name}' score={max_score:.2f} margin={margin:.2f}")
         return response
 
     def describe_handler(self, request, response):
@@ -464,6 +494,20 @@ class FaceServiceNode(Node):
 
             face = max(faces, key=lambda f: f[2] * f[3])
 
+        new_area = float(face[2] * face[3])
+
+        # Si ya existe una referencia para este nombre con una cara mas grande
+        # (mejor resolucion/mas cerca), no la sobreescribimos con una captura
+        # peor: evita degradar la referencia en cada re-registro.
+        if name in self.known_embeddings and new_area < self.known_face_quality.get(name, 0.0):
+            response.success     = True
+            response.name        = name
+            response.description = (
+                f"{name} kept existing reference "
+                f"(new_area={new_area:.0f} < stored_area={self.known_face_quality[name]:.0f})")
+            self.get_logger().info(response.description)
+            return response
+
         img_path = os.path.join(self.faces_dir, f"{name}.png")
         face_align = self.recognizer.alignCrop(frame, face)
         embedding = self.recognizer.feature(face_align)
@@ -477,6 +521,7 @@ class FaceServiceNode(Node):
         # que identify_person pueda reconocer a la persona inmediatamente.
         self.load_known_faces()
         self.known_embeddings[name] = embedding
+        self.known_face_quality[name] = new_area
 
         response.success     = True
         response.name        = name
