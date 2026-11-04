@@ -58,7 +58,7 @@ class FaceServiceNode(Node):
 
         det_path = os.path.join(self.model_dir, face_detection_model)
         rec_path = os.path.join(self.model_dir, face_recognition_model)
-        self.detector   = cv2.FaceDetectorYN.create(det_path, "", (320, 320), 0.9, 0.3, 5000)
+        self.detector   = cv2.FaceDetectorYN.create(det_path, "", (320, 320), 0.75, 0.3, 5000)
         self.recognizer = cv2.FaceRecognizerSF.create(rec_path, "")
 
         self.current_frame   = None
@@ -305,7 +305,7 @@ class FaceServiceNode(Node):
         self.detector.setInputSize((w, h))
         _, faces = self.detector.detect(frame)
 
-        valid_faces = [f for f in faces if f[2] > 40] if faces is not None else []
+        valid_faces = [f for f in faces if f[2] >= 18] if faces is not None else []
         total_faces = 0 if faces is None else len(faces)
         self.get_logger().debug(
             f"detect_person raw_faces={total_faces} valid_faces={len(valid_faces)}")
@@ -426,14 +426,12 @@ class FaceServiceNode(Node):
         results = self.run_florence("<CAPTION_TO_PHRASE_GROUNDING>", pil_img, "person")
         bboxes  = results.get('<CAPTION_TO_PHRASE_GROUNDING>', {}).get('bboxes', [])
 
-        if not bboxes:
-            response.success     = False
-            response.description = "No person detected"
-            return response
-
-        tx1, ty1, tx2, ty2 = map(int, self.select_best_target(bboxes, w, h))
-        crop     = frame[max(0, ty1):min(h, ty2), max(0, tx1):min(w, tx2)]
-        pil_crop = PILImage.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+        if bboxes:
+            tx1, ty1, tx2, ty2 = map(int, self.select_best_target(bboxes, w, h))
+            crop     = frame[max(0, ty1):min(h, ty2), max(0, tx1):min(w, tx2)]
+            pil_crop = PILImage.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+        else:
+            pil_crop = pil_img
 
         result     = self.run_florence("<MORE_DETAILED_CAPTION>", pil_crop)
         raw_output = result.get("<MORE_DETAILED_CAPTION>", "").lower()
